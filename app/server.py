@@ -1,10 +1,11 @@
 """HTTP 服务：维护事务锁管理会话。
 
 路由：
-  GET  /health                         健康检查
-  POST /sessions/{sid}/events          提交一个稳定事件，返回裁决
-  GET  /sessions/{sid}                 查看当前持锁集合、等待队列、撤销事务与裁决序号
-  GET  /sessions/{sid}/events/{eid}    查看某稳定事件标识的首次裁决
+  GET  /health                                   健康检查
+  POST /sessions/{sid}/events                    提交一个稳定事件，返回裁决
+  GET  /sessions/{sid}                           查看当前持锁集合、等待队列、撤销事务与裁决序号
+  GET  /sessions/{sid}/events/{eid}              查看某稳定事件标识的首次裁决
+  GET  /sessions/{sid}/transactions/{tid}/waits  按事务读取稳定排序的完整等待历程
 """
 
 from __future__ import annotations
@@ -76,6 +77,9 @@ REGISTRY = Registry()
 EVENTS_PATH = re.compile(r"^/sessions/([A-Za-z0-9_.\-]+)/events$")
 SESSION_PATH = re.compile(r"^/sessions/([A-Za-z0-9_.\-]+)$")
 EVENT_PATH = re.compile(r"^/sessions/([A-Za-z0-9_.\-]+)/events/([A-Za-z0-9_.\-]+)$")
+WAITS_PATH = re.compile(
+    r"^/sessions/([A-Za-z0-9_.\-]+)/transactions/([A-Za-z0-9_.\-]+)/waits$"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -133,6 +137,24 @@ class Handler(BaseHTTPRequestHandler):
                                       "message": f"事件 {eid} 不存在"})
             else:
                 self._send_json(200, verdict)
+            return
+        m = WAITS_PATH.match(path)
+        if m:
+            sid, tid = m.group(1), m.group(2)
+            mgr = REGISTRY.get(sid)
+            if mgr is None:
+                self._send_json(404, {"ok": False, "error": "session_not_found",
+                                      "message": f"会话 {sid} 不存在"})
+                return
+            with REGISTRY.lock(sid):
+                try:
+                    waits = mgr.wait_history(tid)
+                except LockError as exc:
+                    self._error(exc)
+                    return
+            self._send_json(
+                200, {"session_id": sid, "tid": tid, "waits": waits}
+            )
             return
         m = SESSION_PATH.match(path)
         if m:

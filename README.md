@@ -26,6 +26,27 @@
   默认前滚（`RECOVERY_MODE=rollforward`）；设为 `rollback` 则回到事件前，
   调用方可凭同一稳定事件标识重新提交继续推进。
 
+## 等待历程（审计）
+
+请求或升级**首次进入等待**时，系统保存一条不可变等待历程：触发事件、
+资源、目标模式、当时队列位置，以及直接阻塞它的持锁事务与在先等待项。
+队列推进使该请求获授、死锁裁决撤销其事务（或将来提交清理等待）时，
+只为同一历程**补齐一次**终局及对应裁决序号
+（`outcome.kind ∈ granted | aborted | committed`；`committed` 为预留，
+当前 `commit` 拒绝带等待的事务）。重复事件重放不新增、不改写历程。
+历程随状态原子落盘，服务重启（含崩溃前滚/回滚恢复）后，已结束与仍在
+等待的历程都与当前锁状态一致。
+
+按事务读取稳定排序（按进入等待的裁决序号）的完整历程：
+
+```
+GET /sessions/{sid}/transactions/{tid}/waits
+```
+
+不存在的事务（含属于其他会话的事务，即跨会话查询）与尚未产生等待的
+事务一律返回 404 明确拒绝（`transaction_not_found` /
+`wait_history_not_found`）。
+
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -34,6 +55,7 @@
 | POST | `/sessions/{sid}/events` | 提交事件，返回裁决（新事件 201，重放 200） |
 | GET | `/sessions/{sid}` | 当前持锁、等待队列、撤销事务、裁决序号 |
 | GET | `/sessions/{sid}/events/{eid}` | 查询某稳定事件标识的首次裁决 |
+| GET | `/sessions/{sid}/transactions/{tid}/waits` | 按事务读取稳定排序的完整等待历程 |
 
 事件体：
 
@@ -57,8 +79,8 @@ HOST_PORT=9090 docker compose up app
 
 verify 容器执行：代码测试（unittest，含真实子进程的崩溃前滚/回滚恢复）、
 字节码构建检查、以及对 app 服务的 API/HTTP 冒烟（复现锁升级死锁撤销、
-FIFO 队列推进、幂等与拒绝语义、撤销持久化阶段崩溃后的自动重启恢复），
-最终以退出码报告结果：
+FIFO 队列推进、幂等与拒绝语义、等待历程的升级获授/死锁撤销/重启查询、
+撤销持久化阶段崩溃后的自动重启恢复），最终以退出码报告结果：
 
 ```bash
 docker compose build

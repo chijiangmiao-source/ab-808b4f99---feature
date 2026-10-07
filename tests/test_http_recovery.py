@@ -143,6 +143,22 @@ class CrashRecoveryTest(unittest.TestCase):
             _, v = get(port, f"/sessions/{sid}/events/u2")
             self.assertEqual(v["seq"], 8)
             self.assertEqual([a["tid"] for a in v["aborted"]], ["T2"])
+            # 重启后等待历程与锁状态一致：T1 升级等待后获授，T2 被死锁裁决撤销
+            _, wh1 = get(port, f"/sessions/{sid}/transactions/T1/waits")
+            self.assertEqual(len(wh1["waits"]), 1)
+            rec1 = wh1["waits"][0]
+            self.assertEqual(rec1["event_id"], "u1")
+            self.assertEqual(rec1["resource"], "CH-B")
+            self.assertEqual(rec1["mode"], "X")
+            self.assertTrue(rec1["upgrade"])
+            self.assertEqual(rec1["position"], 1)
+            self.assertEqual([h["tid"] for h in rec1["blocked_by"]["holders"]],
+                             ["T2"])
+            self.assertEqual(rec1["outcome"], {"kind": "granted", "seq": 8})
+            _, wh2 = get(port, f"/sessions/{sid}/transactions/T2/waits")
+            rec2 = wh2["waits"][0]
+            self.assertEqual(rec2["event_id"], "u2")
+            self.assertEqual(rec2["outcome"], {"kind": "aborted", "seq": 8})
             # 可继续处理后续合法事件
             status, v2 = post(port, sid,
                               {"event_id": "c1", "tid": "T1", "action": "commit"})
@@ -172,6 +188,14 @@ class CrashRecoveryTest(unittest.TestCase):
             self.assertEqual(snap["verdict_seq"], 7)
             self.assertEqual(snap["aborted_transactions"], [])
             self.assertIn("CH-B", snap["waiting_queues"])
+            # 回滚到事件前：T1 的历程仍在等待，与等待队列一致；T2 尚无历程
+            _, wh1 = get(port, f"/sessions/{sid}/transactions/T1/waits")
+            self.assertIsNone(wh1["waits"][0]["outcome"])
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                get(port, f"/sessions/{sid}/transactions/T2/waits")
+            self.assertEqual(cm.exception.code, 404)
+            self.assertEqual(json.loads(cm.exception.read().decode())["error"],
+                             "wait_history_not_found")
             # 用同一稳定事件标识重新提交，完成完整裁决
             status, v = post(port, sid,
                              {"event_id": "u2", "tid": "T2",
@@ -182,6 +206,14 @@ class CrashRecoveryTest(unittest.TestCase):
                              {"mode": "X", "holders": ["T1"]})
             _, snap2 = get(port, f"/sessions/{sid}")
             self.assertEqual(snap2["verdict_seq"], 8)
+            # 重新提交只补齐一次终局：T1 获授、T2 被撤销，均对应裁决序号 8
+            _, wh1 = get(port, f"/sessions/{sid}/transactions/T1/waits")
+            self.assertEqual(wh1["waits"][0]["outcome"],
+                             {"kind": "granted", "seq": 8})
+            _, wh2 = get(port, f"/sessions/{sid}/transactions/T2/waits")
+            self.assertEqual(len(wh2["waits"]), 1)
+            self.assertEqual(wh2["waits"][0]["outcome"],
+                             {"kind": "aborted", "seq": 8})
         finally:
             proc2.kill()
             proc2.wait()
@@ -256,10 +288,51 @@ class HttpSmokeTest(unittest.TestCase):
             self.assertEqual(snap4["locks"]["CH"],
                              {"mode": "S", "holders": ["T3"]})
 
+            # 等待历程：T2/T3 的等待分别由释放与提交推进获授
+            _, wh2 = get(port, f"/sessions/{sid}/transactions/T2/waits")
+            self.assertEqual(wh2["waits"][0]["outcome"],
+                             {"kind": "granted", "seq": 7})
+            _, wh3 = get(port, f"/sessions/{sid}/transactions/T3/waits")
+            rec3 = wh3["waits"][0]
+            self.assertEqual(rec3["position"], 2)
+            self.assertEqual([w["tid"] for w in rec3["blocked_by"]["waiters"]],
+                             ["T2"])
+            self.assertEqual(rec3["outcome"], {"kind": "granted", "seq": 8})
+            # T1 从未等待：明确拒绝
+            with self.assertRaises(urllib.error.HTTPError) as cm1:
+                get(port, f"/sessions/{sid}/transactions/T1/waits")
+            self.assertEqual(cm1.exception.code, 404)
+            self.assertEqual(
+                json.loads(cm1.exception.read().decode())["error"],
+                "wait_history_not_found")
+            # 不存在的事务：明确拒绝
+            with self.assertRaises(urllib.error.HTTPError) as cm2:
+                get(port, f"/sessions/{sid}/transactions/T9/waits")
+            self.assertEqual(cm2.exception.code, 404)
+            self.assertEqual(
+                json.loads(cm2.exception.read().decode())["error"],
+                "transaction_not_found")
+            # 跨会话查询：T8 在另一会话存在，在本会话不可读
+            status, _ = post(port, "smoke-other",
+                             {"event_id": "b1", "tid": "T8", "action": "begin"})
+            self.assertEqual(status, 201)
+            with self.assertRaises(urllib.error.HTTPError) as cm3:
+                get(port, f"/sessions/{sid}/transactions/T8/waits")
+            self.assertEqual(cm3.exception.code, 404)
+            self.assertEqual(
+                json.loads(cm3.exception.read().decode())["error"],
+                "transaction_not_found")
+
             # 未知会话与未知事件
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 get(port, "/sessions/nope")
             self.assertEqual(cm.exception.code, 404)
+            with self.assertRaises(urllib.error.HTTPError) as cm4:
+                get(port, "/sessions/nope/transactions/T1/waits")
+            self.assertEqual(cm4.exception.code, 404)
+            self.assertEqual(
+                json.loads(cm4.exception.read().decode())["error"],
+                "session_not_found")
         finally:
             proc.kill()
             proc.wait()
