@@ -9,6 +9,11 @@
 因此在撤销持久化阶段中断后重启，磁盘状态只可能是：该事件之前，
 或该事件完整裁决之后（默认前滚到完整裁决；RECOVERY_MODE=rollback
 则回到事件前，调用方可凭同一稳定事件标识重新提交继续推进）。
+
+等待历程（wait_history）：请求/升级首次入队时建档一条不可变记录
+（触发事件、资源、目标模式、当时队列位置、直接阻塞者）；队列推进获授、
+死锁裁决撤销其事务时，仅为该历程补齐一次终局与对应裁决序号。
+历程随状态原子落盘，重启后与当前锁状态保持一致；重放不重写历程。
 """
 
 from __future__ import annotations
@@ -90,6 +95,7 @@ class LockManager:
             "locks": {},  # resource -> {"mode": "S"|"X", "holders": [tids]}
             "queues": {},  # resource -> [{"tid","mode","upgrade","event_id","enq_seq"}]
             "events": {},  # event_id -> 完整裁决（首次裁决，幂等返回）
+            "wait_history": {},  # tid -> [不可变等待历程]，终局仅补齐一次
             "pending": None,  # 撤销事件两阶段提交的「事件前」检查点
         }
 
@@ -98,6 +104,7 @@ class LockManager:
             return self._blank_state()
         with open(self.path, "r", encoding="utf-8") as fh:
             state = json.load(fh)
+        state.setdefault("wait_history", {})  # 兼容旧版状态文件
         pending = state.get("pending")
         if pending:
             if self.fault.recovery_mode == "rollback":
@@ -143,6 +150,27 @@ class LockManager:
         out.pop("_content_hash", None)
         out["replayed"] = True
         return out
+
+    def wait_history(self, tid: str) -> list[dict]:
+        """按事务读取完整等待历程，按入队裁决序号稳定排序。
+
+        不存在的事务（含属于其他会话的 tid）与尚未产生等待的事务一律明确拒绝。
+        """
+        if tid not in self.state["txs"]:
+            raise LockError(
+                "transaction_not_found",
+                f"事务 {tid} 不属于会话 {self.session_id}（不存在或跨会话）",
+                404,
+            )
+        records = self.state["wait_history"].get(tid) or []
+        if not records:
+            raise LockError(
+                "wait_history_not_found",
+                f"事务 {tid} 尚未产生等待历程",
+                404,
+            )
+        ordered = sorted(records, key=lambda r: r["enq_seq"])
+        return copy.deepcopy(ordered)
 
     # ------------------------------------------------------------------ 入口
 
@@ -255,9 +283,9 @@ class LockManager:
                     f"事务 {tid} 已提交，不能再接受新操作",
                 )
             if action == "request":
-                will_abort = self._apply_request(st, p, enqueue_info)
+                will_abort = self._apply_request(st, p, enqueue_info, seq)
             elif action == "upgrade":
-                will_abort = self._apply_upgrade(st, p, enqueue_info)
+                will_abort = self._apply_upgrade(st, p, enqueue_info, seq)
             elif action == "release":
                 self._apply_release(st, tid, resource)
             elif action == "commit":
@@ -280,12 +308,12 @@ class LockManager:
                 if crash:
                     # 模拟在撤销持久化阶段中断：磁盘上恰好是事件前状态
                     os._exit(7)
-            victims = self._resolve_deadlocks(st, granted)
+            victims = self._resolve_deadlocks(st, granted, seq)
             aborted = [
                 {"tid": v, "begin_seq": st["txs"][v]["begin_seq"]} for v in victims
             ]
         else:
-            self._pump_all(st, granted)
+            self._pump_all(st, granted, seq)
 
         verdict = {
             "ok": True,
@@ -320,8 +348,29 @@ class LockManager:
     def _is_queued(self, st: dict, tid: str, resource: str) -> bool:
         return any(e["tid"] == tid for e in st["queues"].get(resource, []))
 
+    def _direct_blockers(self, st: dict, resource: str, tid: str, mode: str) -> dict:
+        """入队瞬间的直接阻塞者：不相容的持锁事务 + 全部在先等待项（严格 FIFO）。
+
+        自身持锁（升级时的 S）不算阻塞者；与所求模式相容的持有者也不算。
+        """
+        lk = st["locks"].get(resource)
+        holders: list[str] = []
+        if lk is not None and (mode == EXCLUSIVE or lk["mode"] == EXCLUSIVE):
+            holders = [h for h in lk["holders"] if h != tid]
+        waiters = [
+            {
+                "tid": e["tid"],
+                "mode": e["mode"],
+                "upgrade": e["upgrade"],
+                "event_id": e["event_id"],
+            }
+            for e in st["queues"].get(resource, [])
+        ]
+        return {"holders": holders, "waiters": waiters}
+
     def _enqueue(self, st: dict, p: dict, mode: str, upgrade: bool,
-                 enqueue_info: list[dict]) -> None:
+                 enqueue_info: list[dict], seq: int) -> None:
+        blockers = self._direct_blockers(st, p["resource"], p["tid"], mode)
         entry = {
             "tid": p["tid"],
             "mode": mode,
@@ -330,16 +379,43 @@ class LockManager:
             "enq_seq": st["next_seq"],
         }
         st["queues"].setdefault(p["resource"], []).append(entry)
+        position = len(st["queues"][p["resource"]])
         enqueue_info.append(
             {
                 "resource": p["resource"],
                 "mode": mode,
                 "upgrade": upgrade,
-                "position": len(st["queues"][p["resource"]]),
+                "position": position,
+            }
+        )
+        # 不可变等待历程：首次入队即建档，此后仅允许补齐一次终局
+        st["wait_history"].setdefault(p["tid"], []).append(
+            {
+                "event_id": p["event_id"],
+                "tid": p["tid"],
+                "resource": p["resource"],
+                "mode": mode,
+                "upgrade": upgrade,
+                "position": position,
+                "enq_seq": seq,
+                "blocked_by": blockers,
+                "outcome": None,
+                "outcome_seq": None,
             }
         )
 
-    def _apply_request(self, st: dict, p: dict, enqueue_info: list[dict]) -> bool:
+    def _close_history(self, st: dict, tid: str, event_id: str,
+                       outcome: str, seq: int) -> None:
+        """为同一历程补齐终局与裁决序号，仅一次；已补齐或无此历程时不做任何事。"""
+        for rec in st["wait_history"].get(tid, []):
+            if rec["event_id"] == event_id:
+                if rec["outcome"] is None:
+                    rec["outcome"] = outcome
+                    rec["outcome_seq"] = seq
+                return
+
+    def _apply_request(self, st: dict, p: dict, enqueue_info: list[dict],
+                       seq: int) -> bool:
         tid, resource, mode = p["tid"], p["resource"], p["mode"]
         if self._is_queued(st, tid, resource):
             raise LockError(
@@ -352,7 +428,7 @@ class LockManager:
                     "already_holds", f"事务 {tid} 已持有 {resource} 的 {mode} 锁"
                 )
             # 持 S 请 X 等价于升级
-            return self._apply_upgrade(st, p, enqueue_info)
+            return self._apply_upgrade(st, p, enqueue_info, seq)
 
         queue = st["queues"].get(resource, [])
         holders = self._holders(st, resource)
@@ -366,10 +442,11 @@ class LockManager:
         if can_grant:
             self._grant(st, resource, tid, mode, upgrade=False)
             return False
-        self._enqueue(st, p, mode, upgrade=False, enqueue_info=enqueue_info)
+        self._enqueue(st, p, mode, upgrade=False, enqueue_info=enqueue_info, seq=seq)
         return self._in_deadlock(st)
 
-    def _apply_upgrade(self, st: dict, p: dict, enqueue_info: list[dict]) -> bool:
+    def _apply_upgrade(self, st: dict, p: dict, enqueue_info: list[dict],
+                       seq: int) -> bool:
         tid, resource = p["tid"], p["resource"]
         if self._is_queued(st, tid, resource):
             raise LockError(
@@ -388,7 +465,8 @@ class LockManager:
         if not queue and not others:
             self._grant(st, resource, tid, EXCLUSIVE, upgrade=True)
             return False
-        self._enqueue(st, p, EXCLUSIVE, upgrade=True, enqueue_info=enqueue_info)
+        self._enqueue(st, p, EXCLUSIVE, upgrade=True, enqueue_info=enqueue_info,
+                      seq=seq)
         # 升级等待期间继续保留自己的 S 锁
         return self._in_deadlock(st)
 
@@ -432,7 +510,7 @@ class LockManager:
         else:
             lk["holders"].append(tid)
 
-    def _pump(self, st: dict, resource: str, granted: list[dict]) -> None:
+    def _pump(self, st: dict, resource: str, granted: list[dict], seq: int) -> None:
         """严格 FIFO 推进：只看队首，后到请求绝不越过队首；连续可授予的队首连续推进。"""
         queue = st["queues"].get(resource, [])
         while queue:
@@ -446,6 +524,7 @@ class LockManager:
                 break
             queue.pop(0)
             self._grant(st, resource, entry["tid"], entry["mode"], entry["upgrade"])
+            self._close_history(st, entry["tid"], entry["event_id"], "granted", seq)
             granted.append(
                 {
                     "resource": resource,
@@ -457,9 +536,9 @@ class LockManager:
         if not queue:
             st["queues"].pop(resource, None)
 
-    def _pump_all(self, st: dict, granted: list[dict]) -> None:
+    def _pump_all(self, st: dict, granted: list[dict], seq: int) -> None:
         for resource in list(st["queues"].keys()):
-            self._pump(st, resource, granted)
+            self._pump(st, resource, granted, seq)
 
     # ---------------------------------------------------------- 死锁检测
 
@@ -514,7 +593,8 @@ class LockManager:
     def _in_deadlock(self, st: dict) -> bool:
         return bool(self._cycle_nodes(self._waits_for_graph(st)))
 
-    def _resolve_deadlocks(self, st: dict, granted: list[dict]) -> list[str]:
+    def _resolve_deadlocks(self, st: dict, granted: list[dict],
+                           seq: int) -> list[str]:
         victims: list[str] = []
         while True:
             cycle = self._cycle_nodes(self._waits_for_graph(st))
@@ -522,19 +602,24 @@ class LockManager:
                 break
             # 裁决规则：撤销环上开始序号最大者
             victim = max(cycle, key=lambda t: (st["txs"][t]["begin_seq"], t))
-            self._abort(st, victim)
+            self._abort(st, victim, seq)
             victims.append(victim)
             # 原子清除后推进队列；推进可能暴露新的环，继续裁决
-            self._pump_all(st, granted)
+            self._pump_all(st, granted, seq)
         return victims
 
-    def _abort(self, st: dict, tid: str) -> None:
-        # 原子清除该事务的全部等待
+    def _abort(self, st: dict, tid: str, seq: int) -> None:
+        # 原子清除该事务的全部等待，并为其等待历程补齐「撤销」终局
         for resource in list(st["queues"].keys()):
-            st["queues"][resource] = [
-                e for e in st["queues"][resource] if e["tid"] != tid
-            ]
-            if not st["queues"][resource]:
+            kept = []
+            for e in st["queues"][resource]:
+                if e["tid"] == tid:
+                    self._close_history(st, tid, e["event_id"], "aborted", seq)
+                else:
+                    kept.append(e)
+            if kept:
+                st["queues"][resource] = kept
+            else:
                 del st["queues"][resource]
         # 原子清除该事务的全部锁
         for resource in list(st["locks"].keys()):

@@ -231,6 +231,169 @@ class UpgradeDeadlockTest(unittest.TestCase):
         self.assertEqual(v["state"]["locks"], {})
 
 
+class WaitHistoryTest(unittest.TestCase):
+    def test_no_history_when_granted_immediately(self):
+        g = Mgr()
+        g.run("e1", "T1", "begin")
+        g.run("e2", "T1", "request", "R", SHARED)
+        with self.assertRaises(LockError) as cm:
+            g.m.wait_history("T1")
+        self.assertEqual(cm.exception.code, "wait_history_not_found")
+        self.assertEqual(cm.exception.http_status, 404)
+
+    def test_unknown_transaction_rejected(self):
+        g = Mgr()
+        g.run("e1", "T1", "begin")
+        with self.assertRaises(LockError) as cm:
+            g.m.wait_history("T9")
+        self.assertEqual(cm.exception.code, "transaction_not_found")
+        self.assertEqual(cm.exception.http_status, 404)
+
+    def test_wait_then_grant_fills_outcome_once(self):
+        g = Mgr()
+        g.run("b1", "T1", "begin")                    # seq1
+        g.run("b2", "T2", "begin")                    # seq2
+        g.run("r1", "T1", "request", "R", EXCLUSIVE)  # seq3
+        v = g.run("r2", "T2", "request", "R", SHARED)  # seq4 等待
+        self.assertTrue(v["enqueued"])
+        h = g.m.wait_history("T2")
+        self.assertEqual(len(h), 1)
+        rec = h[0]
+        self.assertEqual(rec["event_id"], "r2")
+        self.assertEqual(rec["tid"], "T2")
+        self.assertEqual(rec["resource"], "R")
+        self.assertEqual(rec["mode"], SHARED)
+        self.assertFalse(rec["upgrade"])
+        self.assertEqual(rec["position"], 1)
+        self.assertEqual(rec["enq_seq"], 4)
+        self.assertEqual(rec["blocked_by"]["holders"], ["T1"])
+        self.assertEqual(rec["blocked_by"]["waiters"], [])
+        self.assertIsNone(rec["outcome"])
+        self.assertIsNone(rec["outcome_seq"])
+        # T1 提交 -> 队列推进，T2 获授，终局只补齐一次
+        g.run("c1", "T1", "commit")                   # seq5
+        g.run("c2", "T2", "commit")                   # seq6 不再触碰历程
+        h = g.m.wait_history("T2")
+        self.assertEqual(len(h), 1)
+        self.assertEqual(h[0]["outcome"], "granted")
+        self.assertEqual(h[0]["outcome_seq"], 5)
+
+    def test_upgrade_blocked_by_holders_and_prior_waiters(self):
+        # T1、T2 共持 S；T3 排 X 居队首；T2 升级 -> 阻塞者为持有人 T1 与在先等待 T3
+        g = Mgr()
+        g.run("b1", "T1", "begin")
+        g.run("b2", "T2", "begin")
+        g.run("b3", "T3", "begin")
+        g.run("s1", "T1", "request", "R", SHARED)
+        g.run("s2", "T2", "request", "R", SHARED)
+        g.run("x1", "T3", "request", "R", EXCLUSIVE)  # seq6 等待
+        v = g.run("u1", "T2", "upgrade", "R")          # seq7 等待，位置 2
+        self.assertEqual(v["enqueued"][0]["position"], 2)
+        rec = g.m.wait_history("T2")[0]
+        self.assertEqual(rec["event_id"], "u1")
+        self.assertEqual(rec["mode"], EXCLUSIVE)
+        self.assertTrue(rec["upgrade"])
+        self.assertEqual(rec["position"], 2)
+        self.assertEqual(rec["enq_seq"], 7)
+        self.assertEqual(rec["blocked_by"]["holders"], ["T1"])
+        waiters = rec["blocked_by"]["waiters"]
+        self.assertEqual([w["tid"] for w in waiters], ["T3"])
+        self.assertEqual(waiters[0]["mode"], EXCLUSIVE)
+        self.assertEqual(waiters[0]["event_id"], "x1")
+
+    def test_upgrade_self_holding_not_a_blocker(self):
+        # T1 独持 S，T2 排 X；T1 升级 -> 直接阻塞者只有在先等待的 T2
+        g = Mgr()
+        g.run("b1", "T1", "begin")
+        g.run("b2", "T2", "begin")
+        g.run("s1", "T1", "request", "R", SHARED)
+        g.run("x1", "T2", "request", "R", EXCLUSIVE)
+        g.run("u1", "T1", "upgrade", "R")
+        rec = g.m.wait_history("T1")[0]
+        self.assertEqual(rec["blocked_by"]["holders"], [])
+        self.assertEqual([w["tid"] for w in rec["blocked_by"]["waiters"]], ["T2"])
+        self.assertEqual(rec["position"], 2)
+
+    def test_deadlock_closes_victim_and_grants_survivor(self):
+        g = Mgr()
+        g.run("b1", "T1", "begin")
+        g.run("b2", "T2", "begin")
+        g.run("s1", "T1", "request", "CH-A", SHARED)
+        g.run("s2", "T2", "request", "CH-B", SHARED)
+        g.run("x1", "T1", "request", "CH-B", SHARED)
+        g.run("x2", "T2", "request", "CH-A", SHARED)
+        g.run("u1", "T1", "upgrade", "CH-B")           # seq7 等待
+        v = g.run("u2", "T2", "upgrade", "CH-A")       # seq8 成环，撤销 T2
+        self.assertEqual([a["tid"] for a in v["aborted"]], ["T2"])
+        h2 = g.m.wait_history("T2")
+        self.assertEqual(len(h2), 1)
+        self.assertEqual(h2[0]["event_id"], "u2")
+        self.assertEqual(h2[0]["outcome"], "aborted")
+        self.assertEqual(h2[0]["outcome_seq"], 8)
+        self.assertEqual(h2[0]["blocked_by"]["holders"], ["T1"])
+        h1 = g.m.wait_history("T1")
+        self.assertEqual(h1[0]["event_id"], "u1")
+        self.assertEqual(h1[0]["outcome"], "granted")
+        self.assertEqual(h1[0]["outcome_seq"], 8)
+
+    def test_replay_and_rejection_do_not_touch_history(self):
+        g = Mgr()
+        g.run("b1", "T1", "begin")
+        g.run("b2", "T2", "begin")
+        g.run("r1", "T1", "request", "R", EXCLUSIVE)
+        g.run("r2", "T2", "request", "R", SHARED)      # seq4 等待
+        again = g.run("r2", "T2", "request", "R", SHARED)  # 重放
+        self.assertTrue(again["replayed"])
+        h = g.m.wait_history("T2")
+        self.assertEqual(len(h), 1)
+        self.assertIsNone(h[0]["outcome"])
+        # 同标识不同内容被拒，不新增不改写
+        with self.assertRaises(LockError):
+            g.run("r2", "T2", "request", "R", EXCLUSIVE)
+        # 语义拒绝（等待中重复申请）也不新增
+        with self.assertRaises(LockError):
+            g.run("r3", "T2", "request", "R", SHARED)
+        h = g.m.wait_history("T2")
+        self.assertEqual(len(h), 1)
+        self.assertIsNone(h[0]["outcome"])
+
+    def test_multiple_waits_stable_order(self):
+        g = Mgr()
+        g.run("b1", "T1", "begin")
+        g.run("b2", "T2", "begin")
+        g.run("r1", "T2", "request", "R1", EXCLUSIVE)
+        g.run("r2", "T2", "request", "R2", EXCLUSIVE)
+        g.run("w1", "T1", "request", "R1", SHARED)     # seq5 等待
+        g.run("w2", "T1", "request", "R2", SHARED)     # seq6 等待
+        h = g.m.wait_history("T1")
+        self.assertEqual([r["event_id"] for r in h], ["w1", "w2"])
+        self.assertEqual([r["enq_seq"] for r in h], [5, 6])
+        self.assertEqual([r["resource"] for r in h], ["R1", "R2"])
+
+    def test_history_survives_reload_and_stays_consistent(self):
+        d = tempfile.mkdtemp()
+        m = LockManager("hist", d)
+        m.submit(ev("b1", "T1", "begin"))
+        m.submit(ev("b2", "T2", "begin"))
+        m.submit(ev("r1", "T1", "request", "R", EXCLUSIVE))
+        m.submit(ev("r2", "T2", "request", "R", SHARED))
+        m2 = LockManager("hist", d)
+        h = m2.wait_history("T2")
+        self.assertEqual(len(h), 1)
+        self.assertIsNone(h[0]["outcome"])
+        # 仍在等待的历程与当前等待队列一致
+        self.assertEqual(
+            [e["tid"] for e in m2.snapshot()["waiting_queues"]["R"]], ["T2"]
+        )
+        # 重载后继续推进，终局正确补齐
+        m2.submit(ev("c1", "T1", "commit"))
+        self.assertEqual(m2.wait_history("T2")[0]["outcome"], "granted")
+        self.assertEqual(m2.wait_history("T2")[0]["outcome_seq"], 5)
+        # 再次重载：已结束的历程保持终局
+        m3 = LockManager("hist", d)
+        self.assertEqual(m3.wait_history("T2")[0]["outcome"], "granted")
+
+
 class IdempotencyTest(unittest.TestCase):
     def test_duplicate_event_id_returns_first_verdict(self):
         g = Mgr()
